@@ -107,7 +107,7 @@ func main() {
 	flag.DurationVar(&requeueDependency, "requeue-dependency", 5*time.Second,
 		"The interval at which failing dependencies are reevaluated.")
 	flag.StringVar(&defaultServiceAccount, "default-service-account", "",
-		"The default service account used for impersonation.")
+		"The default service account used to reconcile cross-namespace artifacts and managed namespaces.")
 
 	aclOptions.BindFlags(flag.CommandLine)
 	artifactOptions.BindFlags(flag.CommandLine)

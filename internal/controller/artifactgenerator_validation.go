@@ -46,15 +46,21 @@ func (r *ArtifactGeneratorReconciler) validateSpec(obj *swapi.ArtifactGenerator)
 		}
 	}
 
-	// Validate output artifact.
-	nameMap := make(map[string]bool)
+	// Validate output artifacts. Artifacts are uniquely identified by their
+	// namespace and name, as the same name may be used in different namespaces.
+	type artifactKey struct {
+		namespace string
+		name      string
+	}
+	artifactMap := make(map[artifactKey]bool)
 	for _, artifact := range obj.Spec.OutputArtifacts {
-		// Check for duplicate artifact names.
-		if nameMap[artifact.Name] {
+		key := artifactKey{namespace: obj.GetArtifactNamespace(&artifact), name: artifact.Name}
+		if artifactMap[key] {
 			return r.newTerminalErrorFor(obj,
 				swapi.ValidationFailedReason,
-				"duplicate artifact name '%s' found", artifact.Name)
+				"duplicate artifact name '%s' found in namespace '%s'", artifact.Name, key.namespace)
 		}
+		artifactMap[key] = true
 
 		if obj.Spec.PathPattern == "" {
 			if errs := apivalidation.NameIsDNSSubdomain(artifact.Name, false); len(errs) > 0 {
@@ -62,6 +68,15 @@ func (r *ArtifactGeneratorReconciler) validateSpec(obj *swapi.ArtifactGenerator)
 					swapi.ValidationFailedReason,
 					"artifact name %q is not a valid Kubernetes object name: %s",
 					artifact.Name, strings.Join(errs, "; "))
+			}
+
+			if artifact.Namespace != "" {
+				if errs := apivalidation.ValidateNamespaceName(artifact.Namespace, false); len(errs) > 0 {
+					return r.newTerminalErrorFor(obj,
+						swapi.ValidationFailedReason,
+						"artifact namespace %q is not a valid Kubernetes namespace: %s",
+						artifact.Namespace, strings.Join(errs, "; "))
+				}
 			}
 		}
 
@@ -72,7 +87,6 @@ func (r *ArtifactGeneratorReconciler) validateSpec(obj *swapi.ArtifactGenerator)
 				"artifact %s revision source alias '%s' not found",
 				artifact.Name, strings.TrimPrefix(artifact.Revision, "@"))
 		}
-		nameMap[artifact.Name] = true
 	}
 
 	return nil

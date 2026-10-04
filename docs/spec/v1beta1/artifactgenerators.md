@@ -285,8 +285,8 @@ Each artifact must specify:
 - `name` (required): The name of the generated ExternalArtifact resource. It must be unique in the context
   of the ArtifactGenerator and must conform to Kubernetes resource naming conventions. Supports capture placeholders if `pathPattern` is used.
 - `namespace` (optional): The namespace where the generated ExternalArtifact is created.
-  If not specified, it defaults to the ArtifactGenerator namespace. See
-  [Cross-namespace Artifacts](#cross-namespace-artifacts).
+  If not specified, it defaults to the ArtifactGenerator namespace. Supports capture placeholders
+  if `pathPattern` is used. See [Cross-namespace Artifacts](#cross-namespace-artifacts).
 - `copy` (required): A list of copy operations to perform from sources to the artifact.
 - `revision` (optional): A specific source revision to use in the format `@alias`.
   If not specified, the revision is automatically computed as `latest@<digest>` based on the artifact content.
@@ -294,6 +294,10 @@ Each artifact must specify:
   in the format `@alias`. This is useful for the decomposition use case, where you want to track
   the original source revision of the artifact (e.g. the monorepo commit SHA) without affecting
   the artifact revision itself.
+
+When `pathPattern` is not set, `name` and `namespace` are validated as a Kubernetes object name
+and namespace respectively. When `pathPattern` is set, these fields are treated as templates and
+the rendered values are validated instead.
 
 ```yaml
 spec:
@@ -450,17 +454,17 @@ ExternalArtifact in a different namespace. This is useful for multi-tenant clust
 where the sources and the ArtifactGenerator run in a shared namespace, while the
 generated artifacts are consumed by tenants in their own namespaces.
 
-The controller uses the ServiceAccount credentials only for artifacts whose
-`.namespace` is set to a namespace different from the ArtifactGenerator namespace.
-For artifacts in the ArtifactGenerator namespace (the default when `.namespace` is not
-set), the controller always uses its own credentials, even when a ServiceAccount is
-configured. This keeps the behavior of existing ArtifactGenerators unchanged.
+When `.spec.serviceAccountName` is set, the controller impersonates that
+ServiceAccount for every generated ExternalArtifact, including the ones created
+in the ArtifactGenerator namespace. The ServiceAccount must exist in the
+ArtifactGenerator namespace, and its RBAC bindings determine which namespaces it
+can access.
 
-For artifacts targeting another namespace, the controller impersonates the ServiceAccount
-configured in `.spec.serviceAccountName`. The ServiceAccount must exist in the
-ArtifactGenerator namespace, and its RBAC bindings determine which namespaces it can
-access. When `.spec.serviceAccountName` is not specified, the controller uses its own
-credentials.
+When `.spec.serviceAccountName` is not specified, the controller uses its own
+credentials for artifacts in the ArtifactGenerator namespace (the default when
+`.namespace` is not set). For artifacts targeting another namespace, it uses the
+default ServiceAccount configured by the cluster administrator (see below), or
+its own credentials when no default is configured.
 
 For example, the following generator creates an ExternalArtifact in the `tenant-app`
 namespace, using the `tenant-artifacts` ServiceAccount:
@@ -487,9 +491,108 @@ spec:
 
 **Note** that on multi-tenant clusters, platform admins should configure a default
 ServiceAccount for impersonation by starting the controller with the
-`--default-service-account=<name>` flag. It is used whenever `.spec.serviceAccountName`
-is not specified, and, like `.spec.serviceAccountName`, it only applies to artifacts
-targeting a namespace different from the ArtifactGenerator namespace.
+`--default-service-account=<name>` flag. It is used whenever
+`.spec.serviceAccountName` is not specified, and only applies to artifacts
+targeting a namespace different from the ArtifactGenerator namespace and to the
+managed namespaces those artifacts target. Artifacts in the ArtifactGenerator
+namespace keep using the controller credentials unless `.spec.serviceAccountName`
+is set, so enabling the default does not change how in-namespace artifacts are
+reconciled. Set `.spec.serviceAccountName` when an ArtifactGenerator must be
+reconciled entirely with a specific ServiceAccount.
+
+When `pathPattern` is set, `.spec.artifacts[].namespace` may use capture placeholders,
+so each matched directory can be published to a namespace derived from the captured
+values. For example, the following generator decomposes a monorepo into one
+ExternalArtifact per tenant namespace:
+
+```yaml
+apiVersion: source.extensions.fluxcd.io/v1beta1
+kind: ArtifactGenerator
+metadata:
+  name: tenants
+  namespace: flux-system
+spec:
+  serviceAccountName: tenant-artifacts
+  sources:
+    - alias: repo
+      kind: GitRepository
+      name: my-monorepo
+  pathPattern: "@repo/tenants/{tenant}/apps/{app}"
+  artifacts:
+    - name: "{app}"
+      namespace: "{tenant}"
+      copy:
+        - from: "@repo/tenants/{tenant}/apps/{app}/**"
+          to: "@artifact/"
+```
+
+The captured directory names are lowercased before being used as the artifact
+name and namespace, so a directory named `Tenant-A` is published to the
+`tenant-a` namespace. The rendered namespace must be a valid Kubernetes
+namespace; otherwise the reconciliation fails with a terminal error.
+
+### Namespace Management
+
+By default, the controller does not manage the namespaces targeted by the
+generated artifacts: they must already exist and are left untouched. The
+`.spec.namespaces` field can be used to make the controller the manager
+of those namespaces:
+
+- `.spec.namespaces.strategy` (required when `.spec.namespaces` is set):
+  `Unmanaged` or `Managed`. When `.spec.namespaces` is omitted, the target
+  namespaces are unmanaged.
+- `.spec.namespaces.prune` (optional): whether the controller deletes
+  managed namespaces that are no longer targeted by any generated artifact, or
+  when the ArtifactGenerator is deleted. Defaults to `true`.
+
+When set to `Managed`, the controller creates the namespaces that do not exist
+and applies `.spec.commonMetadata` to all of them, along with the
+`app.kubernetes.io/managed-by` and `source.extensions.fluxcd.io/generator`
+labels. Namespaces that already exist are adopted, and namespaces managed by
+another ArtifactGenerator are taken over, in both cases a warning event is
+emitted. Combined with `pathPattern`, this allows namespaces to be created and
+removed dynamically as directories are added or removed from the source.
+
+```yaml
+apiVersion: source.extensions.fluxcd.io/v1beta1
+kind: ArtifactGenerator
+metadata:
+  name: tenants
+  namespace: flux-system
+spec:
+  namespaces:
+    strategy: Managed
+    prune: true
+  commonMetadata:
+    labels:
+      app.kubernetes.io/part-of: tenants
+  sources:
+    - alias: repo
+      kind: GitRepository
+      name: my-monorepo
+  pathPattern: "@repo/tenants/{tenant}"
+  artifacts:
+    - name: "{tenant}"
+      namespace: "{tenant}"
+      copy:
+        - from: "@repo/tenants/{tenant}/**"
+          to: "@artifact/"
+```
+
+**Note** that pruning deletes the entire namespace and everything in it, and
+cannot be undone. Managed namespaces are tracked in `.status.inventory`, so set
+`.spec.namespaces.prune` to `false` if the namespaces may contain
+resources that must be preserved. If a delete request is rejected by the API
+server, the namespace is kept in the inventory and the deletion is retried on
+the next reconciliation.
+
+Namespace management uses the same credentials as artifact generation. When
+`.spec.serviceAccountName` is set, the controller impersonates it. Otherwise,
+when `--default-service-account` is set, the controller impersonates the default
+for the namespaces targeted by cross-namespace artifacts; otherwise it uses its
+own credentials. Creating and deleting namespaces requires cluster-scoped RBAC,
+so the ServiceAccount must be bound to a `ClusterRole` granting the `namespaces`
+verbs.
 
 ## Working with ArtifactGenerators
 
@@ -600,9 +703,19 @@ When the ArtifactGenerator is stalled, the controller sets the following conditi
 
 ### Inventory
 
-The controller reports the list of generated ExternalArtifacts in the`.status.inventory`
-field of the ArtifactGenerator. The inventory is used by the controller to keep track
-of the artifacts in storage and to perform garbage collection of orphaned artifacts.
+The controller reports the list of objects managed by the ArtifactGenerator in
+the `.status.inventory` field. The inventory is used by the controller to keep
+track of the generated ExternalArtifacts and the managed namespaces, and to
+perform garbage collection of the ones that are no longer targeted.
+
+Each entry has a `kind`:
+
+- Generated artifacts have `kind: ExternalArtifact`, along with the `name`,
+  `namespace`, `digest` and `filename` of the referent. The `digest` is the
+  content digest of the artifact.
+- Managed namespaces have `kind: Namespace`, with the namespace `name` and a
+  `digest` computed from the metadata applied by the controller. The
+  `namespace` and `filename` fields are empty as namespaces are cluster-scoped.
 
 ## ArtifactGenerator Events
 
@@ -614,11 +727,12 @@ Events are emitted for the following scenarios:
 
 - ArtifactGenerator reconciliation completion (success or failure).
 - ExternalArtifacts creation, update, or deletion.
+- Namespaces creation, update, adoption, takeover, or deletion.
 - Source fetch failures or access issues.
 - Build failures (e.g. invalid glob patterns, missing files).
 - Storage operations (e.g. garbage collection, integrity validation failures).
-- Drift detection (e.g. manual changes to generated ExternalArtifacts).
-- Ownership conflicts (e.g. an ExternalArtifact generated by another ArtifactGenerator is taken over).
+- Drift detection (e.g. manual changes to generated ExternalArtifacts or managed namespaces).
+- Ownership conflicts (e.g. an ExternalArtifact or namespace managed by another ArtifactGenerator is taken over).
 
 All events are also logged to the controller's standard output and contain 
 the ArtifactGenerator name and namespace.

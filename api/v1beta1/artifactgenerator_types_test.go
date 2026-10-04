@@ -34,3 +34,71 @@ func TestArtifactGeneratorGetArtifactNamespace(t *testing.T) {
 		t.Errorf("GetArtifactNamespace() = %q, want %q", got, "target-ns")
 	}
 }
+
+func TestArtifactGeneratorNamespaces(t *testing.T) {
+	obj := &v1beta1.ArtifactGenerator{}
+
+	if obj.ManagesNamespaces() {
+		t.Error("ManagesNamespaces() = true, want false when namespaces is not set")
+	}
+	if !obj.NamespacePrune() {
+		t.Error("NamespacePrune() = false, want true when namespaces is not set")
+	}
+
+	obj.Spec.Namespaces = &v1beta1.Namespaces{Strategy: v1beta1.NamespaceStrategyUnmanaged}
+	if obj.ManagesNamespaces() {
+		t.Error("ManagesNamespaces() = true, want false for Unmanaged")
+	}
+	if !obj.NamespacePrune() {
+		t.Error("NamespacePrune() = false, want true when prune is not set")
+	}
+
+	prune := false
+	obj.Spec.Namespaces = &v1beta1.Namespaces{
+		Strategy: v1beta1.NamespaceStrategyManaged,
+		Prune:    &prune,
+	}
+	if !obj.ManagesNamespaces() {
+		t.Error("ManagesNamespaces() = false, want true for Managed")
+	}
+	if obj.NamespacePrune() {
+		t.Error("NamespacePrune() = true, want false when prune is false")
+	}
+}
+
+func TestArtifactGeneratorInventoryHelpers(t *testing.T) {
+	obj := &v1beta1.ArtifactGenerator{
+		Status: v1beta1.ArtifactGeneratorStatus{
+			Inventory: []v1beta1.InventoryEntry{
+				{
+					Kind:      "ExternalArtifact",
+					Name:      "app",
+					Namespace: "tenant",
+					Digest:    "sha256:abc",
+					Filename:  "app.tar.gz",
+				},
+				{
+					Kind:   v1beta1.NamespaceKind,
+					Name:   "tenant",
+					Digest: "sha256:def",
+				},
+			},
+		},
+	}
+
+	if !obj.HasArtifactInInventory("app", "tenant", "sha256:abc") {
+		t.Error("HasArtifactInInventory() = false, want true")
+	}
+	if obj.HasArtifactInInventory("tenant", "", "") {
+		t.Error("HasArtifactInInventory() matched a namespace entry")
+	}
+	if !obj.HasNamespaceInInventory("tenant", "sha256:def") {
+		t.Error("HasNamespaceInInventory() = false, want true")
+	}
+	if obj.HasNamespaceInInventory("tenant", "sha256:other") {
+		t.Error("HasNamespaceInInventory() = true for a different digest")
+	}
+	if obj.HasNamespaceInInventory("app", "sha256:def") {
+		t.Error("HasNamespaceInInventory() = true for an artifact entry")
+	}
+}

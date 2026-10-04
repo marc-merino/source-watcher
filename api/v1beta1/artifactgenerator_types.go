@@ -41,6 +41,10 @@ const (
 	ExtractStrategy                  = "Extract"
 	EnabledValue                     = "enabled"
 	DisabledValue                    = "disabled"
+	NamespaceStrategyUnmanaged       = "Unmanaged"
+	NamespaceStrategyManaged         = "Managed"
+	NamespaceKind                    = "Namespace"
+	NamespaceAdoptedReason           = "NamespaceAdopted"
 )
 
 // CommonMetadata defines the common labels and annotations.
@@ -55,7 +59,8 @@ type CommonMetadata struct {
 }
 
 // ArtifactGeneratorSpec defines the desired state of ArtifactGenerator.
-// +kubebuilder:validation:XValidation:rule="has(self.pathPattern) && size(self.pathPattern) > 0 || self.artifacts.all(a, a.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'))",message="artifact names must be valid Kubernetes object names when pathPattern is not set"
+// +kubebuilder:validation:XValidation:rule="has(self.pathPattern) && size(self.pathPattern) > 0 || self.artifacts.all(a, a.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$') && a.name.size() <= 253)",message="artifact names must be valid Kubernetes object names when pathPattern is not set"
+// +kubebuilder:validation:XValidation:rule="has(self.pathPattern) && size(self.pathPattern) > 0 || self.artifacts.all(a, !has(a.__namespace__) || (a.__namespace__.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$') && a.__namespace__.size() <= 63))",message="artifact namespaces must be valid Kubernetes namespaces when pathPattern is not set"
 type ArtifactGeneratorSpec struct {
 	// CommonMetadata specifies the common labels and annotations that are
 	// applied to all resources. Any existing label or annotation will be
@@ -71,15 +76,16 @@ type ArtifactGeneratorSpec struct {
 	Sources []SourceReference `json:"sources"`
 
 	// ServiceAccountName is the name of the ServiceAccount used to reconcile
-	// the generated ExternalArtifacts that target a namespace other than the
-	// ArtifactGenerator namespace. The ServiceAccount must exist in the
-	// ArtifactGenerator namespace. When specified, the controller impersonates
-	// this ServiceAccount for those ExternalArtifacts, and its RBAC bindings
-	// determine the namespaces in which they can be created, updated and
-	// deleted. ExternalArtifacts in the ArtifactGenerator namespace are always
-	// reconciled with the controller credentials.
-	// When not specified, the controller uses its own credentials, or the
-	// default ServiceAccount configured by the cluster administrator.
+	// the generated ExternalArtifacts and the managed Namespaces. The
+	// ServiceAccount must exist in the ArtifactGenerator namespace. When
+	// specified, the controller impersonates this ServiceAccount for all
+	// generated ExternalArtifacts, including those in the ArtifactGenerator
+	// namespace, and its RBAC bindings determine the namespaces in which they
+	// can be created, updated and deleted.
+	// When not specified, the controller uses its own credentials for
+	// ExternalArtifacts in the ArtifactGenerator namespace, and the default
+	// ServiceAccount configured by the cluster administrator (when set) for
+	// artifacts targeting another namespace.
 	// +kubebuilder:validation:Pattern="^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=63
@@ -94,11 +100,36 @@ type ArtifactGeneratorSpec struct {
 	// +optional
 	PathPattern string `json:"pathPattern,omitempty"`
 
+	// Namespaces defines how the controller manages the namespaces
+	// targeted by the generated artifacts.
+	// +optional
+	Namespaces *Namespaces `json:"namespaces,omitempty"`
+
 	// OutputArtifacts is a list of output artifacts to be generated.
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=1000
 	// +required
 	OutputArtifacts []OutputArtifact `json:"artifacts"`
+}
+
+// Namespaces defines how the controller manages the namespaces targeted by
+// the generated artifacts.
+type Namespaces struct {
+	// Strategy specifies the namespace management strategy.
+	// 'Unmanaged' leaves the target namespaces untouched, they must exist and
+	// are not modified by the controller.
+	// 'Managed' makes the controller the manager of the target namespaces: it
+	// creates them when missing and applies the common metadata to them.
+	// When .spec.namespaces is omitted, namespaces are unmanaged.
+	// +kubebuilder:validation:Enum=Unmanaged;Managed
+	// +required
+	Strategy string `json:"strategy"`
+
+	// Prune specifies whether the controller deletes managed namespaces that
+	// are no longer targeted by any generated artifact, or when the
+	// ArtifactGenerator is deleted. Defaults to true.
+	// +optional
+	Prune *bool `json:"prune,omitempty"`
 }
 
 // SourceReference contains the reference to a Flux source-controller resource.
@@ -137,18 +168,20 @@ type SourceReference struct {
 type OutputArtifact struct {
 	// Name is the name of the generated artifact.
 	// When pathPattern is set, this field may use capture placeholders such as "{app}".
-	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=253
+	// The maximum length accommodates capture placeholders; the effective
+	// limits are enforced by the CEL validation when pathPattern is not set.
+	// +kubebuilder:validation:MaxLength=1024
 	// +required
 	Name string `json:"name"`
 
 	// Namespace is the namespace of the generated artifact.
 	// If not provided, defaults to the same namespace as the ArtifactGenerator.
+	// When pathPattern is set, this field may use capture placeholders such as "{app}".
 	// When set to a different namespace, the controller reconciles the artifact
 	// with the credentials of .spec.serviceAccountName or the controller default.
-	// +kubebuilder:validation:Pattern="^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
-	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=63
+	// The maximum length accommodates capture placeholders; the effective
+	// limits are enforced by the CEL validation when pathPattern is not set.
+	// +kubebuilder:validation:MaxLength=1024
 	// +optional
 	Namespace string `json:"namespace,omitempty"`
 
@@ -236,9 +269,10 @@ type ArtifactGeneratorStatus struct {
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
-	// Inventory contains the list of generated ExternalArtifact references.
+	// Inventory contains the list of objects managed by the ArtifactGenerator,
+	// such as the generated ExternalArtifacts and the managed Namespaces.
 	// +optional
-	Inventory []ExternalArtifactReference `json:"inventory,omitempty"`
+	Inventory []InventoryEntry `json:"inventory,omitempty"`
 
 	// ObservedSourcesDigest is a hash representing the current state of
 	// all the sources referenced by the ArtifactGenerator.
@@ -246,24 +280,32 @@ type ArtifactGeneratorStatus struct {
 	ObservedSourcesDigest string `json:"observedSourcesDigest,omitempty"`
 }
 
-// ExternalArtifactReference contains the reference to a
-// generated ExternalArtifact along with its digest.
-type ExternalArtifactReference struct {
-	// Name of the referent artifact.
+// InventoryEntry contains a reference to an object managed by the
+// ArtifactGenerator, such as a generated ExternalArtifact or a managed
+// Namespace.
+type InventoryEntry struct {
+	// Kind is the kind of the referent object.
+	// +kubebuilder:validation:Enum=ExternalArtifact;Namespace
+	// +optional
+	Kind string `json:"kind,omitempty"`
+
+	// Name of the referent object.
 	// +required
 	Name string `json:"name"`
 
-	// Namespace of the referent artifact.
-	// +required
-	Namespace string `json:"namespace"`
+	// Namespace of the referent object. Empty for cluster-scoped objects.
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
 
-	// Digest of the referent artifact.
+	// Digest of the referent object. For generated artifacts this is the
+	// artifact content digest; for managed namespaces this is a digest of the
+	// metadata applied by the controller.
 	// +required
 	Digest string `json:"digest"`
 
 	// Filename is the name of the artifact file.
-	// +required
-	Filename string `json:"filename"`
+	// +optional
+	Filename string `json:"filename,omitempty"`
 }
 
 // GetConditions returns the status conditions of the object.
@@ -303,11 +345,41 @@ func (in *ArtifactGenerator) GetArtifactNamespace(outputArtifact *OutputArtifact
 	return in.Namespace
 }
 
+// ManagesNamespaces returns true when the controller manages the target
+// namespaces of the generated artifacts.
+func (in *ArtifactGenerator) ManagesNamespaces() bool {
+	return in.Spec.Namespaces != nil && in.Spec.Namespaces.Strategy == NamespaceStrategyManaged
+}
+
+// NamespacePrune returns whether the controller prunes managed namespaces
+// that are no longer targeted by any generated artifact, or when the
+// ArtifactGenerator is deleted. It defaults to true.
+func (in *ArtifactGenerator) NamespacePrune() bool {
+	if in.Spec.Namespaces == nil || in.Spec.Namespaces.Prune == nil {
+		return true
+	}
+	return *in.Spec.Namespaces.Prune
+}
+
 // HasArtifactInInventory returns true if the artifact with the given
-// kind, name, namespace, and digest exists in the inventory.
+// name, namespace, and digest exists in the inventory.
 func (in *ArtifactGenerator) HasArtifactInInventory(name, namespace, digest string) bool {
 	for _, ref := range in.Status.Inventory {
+		if ref.Kind == NamespaceKind {
+			continue
+		}
 		if ref.Name == name && ref.Namespace == namespace && ref.Digest == digest {
+			return true
+		}
+	}
+	return false
+}
+
+// HasNamespaceInInventory returns true if the namespace with the given
+// name and metadata digest exists in the inventory.
+func (in *ArtifactGenerator) HasNamespaceInInventory(name, digest string) bool {
+	for _, ref := range in.Status.Inventory {
+		if ref.Kind == NamespaceKind && ref.Name == name && ref.Digest == digest {
 			return true
 		}
 	}
